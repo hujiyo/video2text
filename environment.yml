@@ -1,0 +1,12 @@
+name: video
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy>=1.21.0
+  - av>=10.0.0
+  - soundfile>=0.12.1
+  - pip:
+    - funasr>=1.0.0
