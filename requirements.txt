@@ -1,4 +1,8 @@
-numpy>=1.21.0
-av>=10.0.0
+torch>=2.11.0
+torchaudio>=2.11.0
+av>=18.0.0
 soundfile>=0.12.1
-funasr>=1.0.0
+numpy>=1.21.0
+qwen-asr==0.0.6
+transformers==4.57.6
+accelerate>=1.12.0

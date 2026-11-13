@@ -8,15 +8,22 @@ import platform
 import subprocess
 from functools import partial
 
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-
 try:
     import tkinter as tk
     from tkinter import ttk, filedialog, scrolledtext, messagebox
 except ImportError:
     sys.exit("当前 Python 环境没有 tkinter，请用 conda base 环境或安装 tk。")
 
+if not os.environ.get("HF_HOME"):
+    # 模型约 4.7GB；用户目录在 C 盘时容易不够，默认放到程序所在目录下的 models/。
+    os.environ["HF_HOME"] = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "models"
+    )
+
 import numpy as np
+
+MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
+LANGUAGE = "Chinese"
 
 
 def _import_av():
@@ -41,45 +48,57 @@ def extract_audio(input_path: str, log) -> str:
     for frame in container.decode(audio_stream):
         for resampled in resampler.resample(frame):
             samples.append(resampled.to_ndarray().astype(np.float32) / 32768.0)
+    container.close()
     for resampled in resampler.resample(None):
         samples.append(resampled.to_ndarray().astype(np.float32) / 32768.0)
-    container.close()
 
     if not samples:
         raise ValueError("未能从该文件解码出音频。")
     audio = np.concatenate(samples, axis=1)[0]
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    sf.write(tmp.name, audio, 16000)
     tmp.close()
+    sf.write(tmp.name, audio, 16000)
     return tmp.name
 
 
+_model_lock = threading.Lock()
+_model = None
+
+
+def load_model(log):
+    global _model
+    with _model_lock:
+        if _model is not None:
+            return _model
+        import torch
+        from qwen_asr import Qwen3ASRModel
+
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        dtype = torch.bfloat16 if device != "cpu" else torch.float32
+        log(f"⏳ 正在加载 {MODEL_ID}（设备：{device}），首次运行需下载，请耐心等待...")
+        _model = Qwen3ASRModel.from_pretrained(
+            MODEL_ID,
+            dtype=dtype,
+            device_map=device,
+            max_inference_batch_size=8,
+            max_new_tokens=4096,
+        )
+        log("✅ 模型加载完成。")
+        return _model
+
+
 def transcribe_audio(audio_path: str, output_path: str, log):
-    from funasr import AutoModel
-    log("⏳ 正在加载 FunASR 模型（Paraformer），首次运行需下载，请耐心等待...")
-    model = AutoModel(
-        model="iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
-        vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-        punc_model="iic/punc_ct-transformer_cn-en-common-vocab471067-large",
-        disable_update=True,
-    )
+    model = load_model(log)
     log("🎙️ 开始转录...")
-    result = model.generate(input=audio_path, sentence_timestamp=True)
-    sentences = result[0].get("sentence_info") if result else None
+    result = model.transcribe(audio=[audio_path], language=LANGUAGE)[0]
+    text = result.text.strip()
+
+    if not text:
+        raise RuntimeError("转录结果为空：该音频没有可识别的语音。")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        if sentences:
-            for seg in sentences:
-                start = seg.get("start", 0) / 1000.0
-                end = seg.get("end", 0) / 1000.0
-                text = (seg.get("sentence") or seg.get("text", "")).strip()
-                if text:
-                    f.write(f"[{start:.2f}s -> {end:.2f}s] {text}\n")
-        else:
-            text = result[0].get("text", "").strip() if result else ""
-            if text:
-                f.write(f"[0.00s -> 0.00s] {text}\n")
+        f.write(text)
     log(f"✅ 转录完成：{output_path}")
 
 
@@ -97,17 +116,18 @@ def read_transcript(path: str) -> str:
 
 
 def paragraphize(text: str, sentences_per_para: int = 4):
-    out, buf, cnt = [], "", 0
-    for ch in text:
-        buf += ch
+    parts, start = [], 0
+    cnt = 0
+    for i, ch in enumerate(text):
         if ch in "。！？!?":
             cnt += 1
             if cnt >= sentences_per_para:
-                out.append(buf)
-                buf, cnt = "", 0
-    if buf:
-        out.append(buf)
-    return "\n\n".join(p.strip() for p in out)
+                parts.append(text[start : i + 1])
+                start, cnt = i + 1, 0
+    tail = text[start:]
+    if tail.strip():
+        parts.append(tail)
+    return "\n\n".join(p.strip() for p in parts)
 
 
 def pipeline_transcribe(input_file: str, log):
@@ -127,7 +147,7 @@ def pipeline_transcribe(input_file: str, log):
 
 def pipeline_polish(input_file: str, log):
     raw = read_transcript(input_file)
-    log(f"📄 已读取原文 {len(raw)} 字，拼接去时间戳...")
+    log(f"📄 已读取原文 {len(raw)} 字，正在分段...")
     polished = paragraphize(raw)
     base, _ = os.path.splitext(input_file)
     if base.endswith("_转录结果"):
@@ -201,7 +221,7 @@ class App:
 
         row += 1
         self.btn_polish = ttk.Button(
-            top, text="② 开始精校（去时间戳+分段）", command=self._on_polish
+            top, text="② 开始精校（分段）", command=self._on_polish
         )
         self.btn_polish.grid(row=row, column=0, sticky="ew", pady=(8, 0))
         self.btn_open_polished = ttk.Button(

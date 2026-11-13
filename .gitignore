@@ -20,3 +20,6 @@ Thumbs.db
 *_精校.txt
 
 AGENTS.md
+
+# Model cache
+models/
