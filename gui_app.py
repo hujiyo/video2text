@@ -7,7 +7,6 @@
 import os
 import sys
 import threading
-import re
 import tempfile
 
 import numpy as np
@@ -103,7 +102,7 @@ def close_server():
             _server_tier = None
 
 
-def transcribe_audio(audio_path: str, output_path: str, model_tier: str, log):
+def transcribe_audio(audio_path: str, output_path: str, model_tier: str, log, on_chunk=None):
     server = get_server(model_tier, log)
 
     wav = _load_wav(audio_path)
@@ -112,29 +111,32 @@ def transcribe_audio(audio_path: str, output_path: str, model_tier: str, log):
     log(f"🎙️ 转录中：{total_sec/60:.1f} 分钟音频，切成 {len(chunks)} 段，"
         f"{server.slots} 路并发…")
 
-    texts = server.transcribe_chunks([c for c, _ in chunks], SAMPLE_RATE, MAX_TOKENS)
+    done = 0
+    done_lock = threading.Lock()
+
+    def chunk_done():
+        nonlocal done
+        if on_chunk is None:
+            return
+        with done_lock:
+            done += 1
+            on_chunk(done, len(chunks))
+
+    texts = server.transcribe_chunks(
+        [c for c, _ in chunks], SAMPLE_RATE, MAX_TOKENS, chunk_done
+    )
 
     text = "".join(texts).strip()
     if not text:
         raise RuntimeError("转录结果为空：该音频没有可识别的语音。")
 
+    # 直接输出成段落形式，用户拿到就能读，不必再跑一遍精校
+    text = paragraphize(text)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(text)
-    log(f"✅ 转录完成：{output_path}（{len(text)} 字）")
-
-
-def read_transcript(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    texts = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(r"^\[.*?\]\s*(.*)$", line)
-        texts.append(m.group(1) if m else line)
-    return "".join(texts)
+    chars = len(text.replace("\n", ""))
+    log(f"✅ 转录完成：{output_path}（{chars} 字）")
 
 
 def paragraphize(text: str, sentences_per_para: int = 4):
@@ -159,46 +161,39 @@ def transcript_path(input_file: str, out_dir: str | None = None):
     return os.path.join(base, stem + ".txt")
 
 
-def pipeline_transcribe(input_file: str, model_tier: str, log, out_dir: str | None = None):
+def pipeline_transcribe(input_file: str, model_tier: str, log, out_dir: str | None = None, on_chunk=None):
     tmp_path = None
     try:
         log(f"📁 提取音频：{input_file}")
         tmp_path = extract_audio(input_file, log)
         out = transcript_path(input_file, out_dir)
-        transcribe_audio(tmp_path, out, model_tier, log)
+        transcribe_audio(tmp_path, out, model_tier, log, on_chunk)
         return out
     finally:
         if tmp_path and os.path.isfile(tmp_path):
             os.remove(tmp_path)
 
 
-def pipeline_transcribe_many(input_files, model_tier, log, out_dir: str | None = None):
+def pipeline_transcribe_many(input_files, model_tier, log, out_dir: str | None = None,
+                             on_progress=None):
     """批量转录，返回成功产出的结果路径列表。
 
     单个文件失败不中断整批：记日志后继续下一个。
+    on_progress(第几个, 总数, 当前文件已处理块数, 当前文件总块数, 当前文件路径)
     """
     outputs = []
+    n = len(input_files)
     for i, src in enumerate(input_files, 1):
-        log(f"===== [{i}/{len(input_files)}] {os.path.basename(src)} =====")
+        log(f"===== [{i}/{n}] {os.path.basename(src)} =====")
         try:
-            outputs.append(pipeline_transcribe(src, model_tier, log, out_dir))
+            def chunk(d, t, _i=i, _src=src):
+                if on_progress is not None:
+                    on_progress(_i, n, d, t, _src)
+
+            outputs.append(pipeline_transcribe(src, model_tier, log, out_dir, chunk))
         except Exception as e:
             log(f"💥 第 {i} 个失败：{type(e).__name__}: {e}")
     return outputs
-
-
-def pipeline_polish(input_file: str, log):
-    raw = read_transcript(input_file)
-    log(f"📄 已读取原文 {len(raw)} 字，正在分段...")
-    polished = paragraphize(raw)
-    base, _ = os.path.splitext(input_file)
-    if base.endswith("_转录结果"):
-        base = base[: -len("_转录结果")]
-    output_file = f"{base}_精校.txt"
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write(polished)
-    log(f"✅ 精校完成：{output_file}")
-    return output_file
 
 
 TIER_LABELS = {

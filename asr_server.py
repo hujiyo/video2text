@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def _app_root() -> str:
     """程序根目录（存放 runtime 与随包资源）。
@@ -201,17 +201,23 @@ class Server:
 
     # ---------- 转录 ----------
 
-    def transcribe_chunks(self, chunks, sr, max_tokens=600):
+    def transcribe_chunks(self, chunks, sr, max_tokens=600, on_done=None):
         """把若干音频块并发送进服务，按原顺序返回文本列表。
 
         串行提交但并发执行：ThreadPoolExecutor 的 size 等于槽位数，
         超出槽位的请求会在本地排队，不会把服务打爆。
+        on_done() 每完成一块回调一次，供界面更新进度。
         """
         def one(chunk):
             return self._request(chunk, sr, max_tokens)
 
+        texts = [None] * len(chunks)
         with ThreadPoolExecutor(max_workers=self.slots) as pool:
-            texts = list(pool.map(one, chunks))
+            futures = {pool.submit(one, chunk): i for i, chunk in enumerate(chunks)}
+            for fut in as_completed(futures):
+                texts[futures[fut]] = fut.result()
+                if on_done is not None:
+                    on_done()
         return texts
 
     def _request(self, wav, sr, max_tokens):
