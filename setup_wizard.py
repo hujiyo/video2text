@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from model_downloader import MODEL_FILES, TIER_SIZES, download_tier
+from model_downloader import MODEL_FILES, TIER_SIZES, download_tier, find_local_model
 
 TIER_INFO = [
     ("balanced", "推荐 · 1.7B Q8_0",
@@ -31,6 +31,8 @@ TIER_INFO = [
     ("precise", "高精 · 1.7B bf16",
      "不量化，理论精度上限最高。实测与 Q8_0 结果一致，体积与显存占用更大。"),
 ]
+
+TIER_NAMES = {key: name for key, name, _ in TIER_INFO}
 
 STYLE = """
 QDialog { background: #1e1f22; }
@@ -154,10 +156,24 @@ class DownloadDialog(QDialog):
         self.bridge.failed.connect(self._on_failed)
 
     def _pick_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "选择模型保存目录", self.edit_dir.text())
+        d = QFileDialog.getExistingDirectory(self, "选择模型目录", self.edit_dir.text())
         if d:
             self.edit_dir.setText(d)
             self._update_disk_hint()
+            self._detect_local()
+
+    def _detect_local(self):
+        """目录里已有完整模型时，把按钮切成「使用本地模型」。"""
+        d = self.edit_dir.text().strip()
+        tier = find_local_model(d) if d else None
+        if tier:
+            self.btn_start.setText("使用本地模型")
+            self.lbl_stat.setText(f"✅ 该目录已有可用的模型（{TIER_NAMES.get(tier, tier)}），无需下载。")
+            self.btn_start.setEnabled(True)
+        else:
+            self.btn_start.setText("下载并开始")
+            if self.lbl_stat.text().startswith("✅"):
+                self.lbl_stat.setText("")
 
     def _update_disk_hint(self):
         """显示目标盘剩余空间，避免用户选了个不够的盘。"""
@@ -186,8 +202,16 @@ class DownloadDialog(QDialog):
 
         target = self.edit_dir.text().strip()
         if not target:
-            QMessageBox.warning(self, "提示", "请填写模型保存目录。")
+            QMessageBox.warning(self, "提示", "请填写模型目录。")
             return
+
+        # 目录里已有完整模型就直接用，不联网
+        local_tier = find_local_model(target)
+        if local_tier:
+            self.models_dir = target
+            self._on_finished(local_tier)
+            return
+
         try:
             os.makedirs(target, exist_ok=True)
             probe = os.path.join(target, ".write_test")

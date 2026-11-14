@@ -2,6 +2,7 @@
 """从 ModelScope 下载模型权重。
 
 国内直连，不需要代理。支持断点续传、大小校验与进度回调。
+用户也可以在本地选择已有模型，不必联网。
 """
 import os
 import threading
@@ -35,13 +36,25 @@ MODEL_FILES = {
     ),
 }
 
-TIER_SIZES = {
-    key: sum(size for _, size in files) for key, (_, files) in MODEL_FILES.items()
-}
+TIER_SIZES = {key: sum(size for _, size in files) for key, (_, files) in MODEL_FILES.items()}
 
 
 def url_for(repo: str, filename: str) -> str:
     return f"{MODELSCOPE_BASE}/{repo}/resolve/master/{filename}"
+
+
+def find_local_model(directory: str) -> str | None:
+    """检查目录里有哪些档位的模型是完整可用的，返回档位名或 None。"""
+    if not os.path.isdir(directory):
+        return None
+    for tier, (_, files) in MODEL_FILES.items():
+        if all(
+            os.path.isfile(os.path.join(directory, name))
+            and os.path.getsize(os.path.join(directory, name)) == size
+            for name, size in files
+        ):
+            return tier
+    return None
 
 
 def download_file(url: str, dest: str, expect_size: int, on_progress, cancel_event=None):
@@ -85,11 +98,15 @@ def download_file(url: str, dest: str, expect_size: int, on_progress, cancel_eve
 
 
 def download_tier(tier: str, models_dir: str, on_progress, cancel_event=None):
-    """下载某档位的全部文件。on_progress 收到整体进度。"""
+    """下载某档位的全部文件。on_progress(done, total, 当前文件名)。
+
+    已经完整存在的文件直接跳过，所以用户可以先用别的方式拿到模型，
+    再让这里只补缺的部分。
+    """
     repo, files = MODEL_FILES[tier]
     total_all = sum(size for _, size in files)
 
-    done_files = [0.0]
+    done_files = [0.0] * len(files)
     lock = threading.Lock()
 
     def make_cb(index):
@@ -100,12 +117,12 @@ def download_tier(tier: str, models_dir: str, on_progress, cancel_event=None):
 
         return cb
 
-    if os.path.isdir(models_dir):
-        for i, (name, size) in enumerate(files):
-            path = os.path.join(models_dir, name)
-            if os.path.isfile(path) and os.path.getsize(path) == size:
-                done_files[i] = size
-        on_progress(sum(done_files), total_all, "")
+    # 先扫一遍已存在的文件，把进度直接推进到实际状态
+    for i, (name, size) in enumerate(files):
+        path = os.path.join(models_dir, name)
+        if os.path.isfile(path) and os.path.getsize(path) == size:
+            done_files[i] = size
+    on_progress(sum(done_files), total_all, "")
 
     for i, (name, size) in enumerate(files):
         dest = os.path.join(models_dir, name)
