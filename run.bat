@@ -6,14 +6,9 @@ if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 
 set "ENV_NAME=video"
 
-rem Try conda from PATH first
 where conda >nul 2>&1
-if %errorlevel% equ 0 (
-    echo [INFO] conda found in PATH.
-    goto :activate_env
-)
+if %errorlevel% equ 0 goto :activate_env
 
-rem Try common install locations
 for %%P in (
     "%USERPROFILE%\anaconda3"
     "%USERPROFILE%\miniconda3"
@@ -27,7 +22,6 @@ for %%P in (
     "%USERPROFILE%\Miniconda3"
 ) do (
     if exist "%%~P\Scripts\activate.bat" (
-        echo [INFO] Found conda at: %%~P
         call "%%~P\Scripts\activate.bat" "%%~P"
         goto :activate_env
     )
@@ -43,7 +37,7 @@ exit /b 1
 call conda activate %ENV_NAME%
 if errorlevel 1 (
     echo [ERROR] environment "%ENV_NAME%" not found.
-    echo Create it first:  conda create -n %ENV_NAME% python=3.10
+    echo Create it first:  conda env create -f environment.yml
     pause
     exit /b 1
 )

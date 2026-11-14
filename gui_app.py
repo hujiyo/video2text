@@ -1,3 +1,8 @@
+# -*- coding: utf-8 -*-
+"""视频/音频转录与文本精校 GUI。
+
+推理交给 llama-server 子进程，本程序只做界面、音频提取与调度。
+"""
 import os
 import sys
 import threading
@@ -14,17 +19,18 @@ try:
 except ImportError:
     sys.exit("当前 Python 环境没有 tkinter，请用 conda base 环境或安装 tk。")
 
-if not os.environ.get("HF_HOME"):
-    # 模型约 4.7GB；用户目录在 C 盘时容易不够，默认放到程序所在目录下的 models/。
-    os.environ["HF_HOME"] = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "models"
-    )
-
 import numpy as np
 
-MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
-LANGUAGE = "Chinese"
+from asr_server import Server, MODEL_TIERS
+from chunker import split_by_energy
+
 SAMPLE_RATE = 16000
+# 单块目标时长。注意力开销随长度平方增长，且槽位越短越容易并行排满；
+# 实测 60 秒块在 8 槽下可达 75 倍实时，整段送只有 2 倍。
+CHUNK_SECONDS = 60.0
+# 正常语速一秒 3～5 字，60 秒块上限约 300 token；给 600 留足余量，
+# 同时避免偶发失控的块空转，拖住同批其他请求。
+MAX_TOKENS = 600
 
 
 def _import_av():
@@ -66,64 +72,6 @@ def extract_audio(input_path: str, log) -> str:
     return tmp.name
 
 
-_model_lock = threading.Lock()
-_model = None
-
-
-def load_model(log):
-    global _model
-    with _model_lock:
-        if _model is not None:
-            return _model
-        import torch
-        from qwen_asr import Qwen3ASRModel
-
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        dtype = torch.bfloat16 if device != "cpu" else torch.float32
-        log(f"⏳ 正在加载 {MODEL_ID}（设备：{device}），首次运行需下载，请耐心等待...")
-        _model = Qwen3ASRModel.from_pretrained(
-            MODEL_ID,
-            dtype=dtype,
-            device_map=device,
-            max_inference_batch_size=1,
-            max_new_tokens=4096,
-        )
-        log("✅ 模型加载完成。")
-        return _model
-
-
-# 单条音频一次推理的时长上限。注意力开销随长度平方增长，20 分钟的整块在
-# 8GB 显卡上直接显存溢出；切成小块后总吞吐反而更高（实测 15 分钟素材，
-# 600 秒块要 99 秒、60 秒块只要 20 秒），且切碎后逐字判断更准，不丢内容。
-CHUNK_SECONDS = 60
-
-
-def _plan_batch(model, chunk_seconds, log):
-    """按块长和当前可用显存设定批大小与单条生成上限。
-
-    模型加载后显存已被权重占住，剩余空间才是推理可用的。实测 60 秒音频在
-    bf16 下每条约 0.35GB 峰值，取 80% 余量避免注意力峰值波动顶满。
-    批大小上限 16：再往上批处理收益已趋平，显存峰值却仍线性增长。
-
-    生成上限按块长收紧。正常语音一秒约 3～5 个汉字，60 秒块最多约 300 个
-    token；给到 4096 会让偶发失控的块空转几十倍时长，而批处理时这一块会把
-    同批其余音频一起拖住。
-    """
-    import torch
-
-    model.max_new_tokens = int(chunk_seconds * 8) + 64
-
-    if not torch.cuda.is_available():
-        model.max_inference_batch_size = 1
-        return
-
-    free = torch.cuda.mem_get_info()[0] / 1e9
-    per_item = 0.35 * (chunk_seconds / 60.0)
-    batch = min(16, max(1, int(free * 0.8 // per_item)))
-    model.max_inference_batch_size = batch
-    log(f"📐 显存余 {free:.1f}GB，每条音频按 {per_item:.2f}GB 估算，批大小取 {batch}。")
-
-
 def _load_wav(path):
     import soundfile as sf
 
@@ -135,30 +83,44 @@ def _load_wav(path):
     return data
 
 
-def transcribe_audio(audio_path: str, output_path: str, log):
-    model = load_model(log)
-    _plan_batch(model, CHUNK_SECONDS, log)
+_server_lock = threading.Lock()
+_server: Server | None = None
+_server_tier: str | None = None
 
-    import torch
-    from qwen_asr.inference.utils import split_audio_into_chunks
+
+def get_server(model_tier: str, log) -> Server:
+    """取当前模型的服务实例；切换模型时先关旧的再开新的。"""
+    global _server, _server_tier
+    with _server_lock:
+        if _server is not None and _server_tier != model_tier:
+            log(f"🔄 切换模型：{_server_tier} → {model_tier}，重启推理服务…")
+            _server.close()
+            _server = None
+        if _server is None:
+            _server = Server(model_tier, log)
+            _server_tier = model_tier
+        return _server
+
+
+def close_server():
+    global _server, _server_tier
+    with _server_lock:
+        if _server is not None:
+            _server.close()
+            _server = None
+            _server_tier = None
+
+
+def transcribe_audio(audio_path: str, output_path: str, model_tier: str, log):
+    server = get_server(model_tier, log)
 
     wav = _load_wav(audio_path)
     total_sec = len(wav) / SAMPLE_RATE
-    chunks = split_audio_into_chunks(wav, SAMPLE_RATE, CHUNK_SECONDS)
-    batch = model.max_inference_batch_size
-    log(f"🎙️ 开始转录：{total_sec/60:.1f} 分钟音频，切成 {len(chunks)} 段，每批 {batch} 段...")
+    chunks = split_by_energy(wav, SAMPLE_RATE, CHUNK_SECONDS)
+    log(f"🎙️ 转录中：{total_sec/60:.1f} 分钟音频，切成 {len(chunks)} 段，"
+        f"{server.slots} 路并发…")
 
-    texts = []
-    done_sec = 0.0
-    for start in range(0, len(chunks), batch):
-        group = chunks[start : start + batch]
-        wavs = [(c, SAMPLE_RATE) for c, _ in group]
-        texts.extend(r.text for r in model.transcribe(audio=wavs, language=LANGUAGE))
-        done_sec += sum(len(c) for c, _ in group) / SAMPLE_RATE
-        log(f"  已转 {done_sec/60:.1f}/{total_sec/60:.1f} 分钟"
-            f"（段 {min(start + batch, len(chunks))}/{len(chunks)}）")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    texts = server.transcribe_chunks([c for c, _ in chunks], SAMPLE_RATE, MAX_TOKENS)
 
     text = "".join(texts).strip()
     if not text:
@@ -167,7 +129,7 @@ def transcribe_audio(audio_path: str, output_path: str, log):
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(text)
-    log(f"✅ 转录完成：{output_path}")
+    log(f"✅ 转录完成：{output_path}（{len(text)} 字）")
 
 
 def read_transcript(path: str) -> str:
@@ -198,25 +160,8 @@ def paragraphize(text: str, sentences_per_para: int = 4):
     return "\n\n".join(p.strip() for p in parts)
 
 
-def pipeline_transcribe(input_file: str, log, out_dir: str | None = None):
-    tmp_path = None
-    try:
-        log(f"📁 提取音频：{input_file}")
-        tmp_path = extract_audio(input_file, log)
-        out = transcript_path(input_file, out_dir)
-        transcribe_audio(tmp_path, out, log)
-        log("🎯 转录流程完成。")
-        return out
-    finally:
-        if tmp_path and os.path.isfile(tmp_path):
-            os.remove(tmp_path)
-
-
 def transcript_path(input_file: str, out_dir: str | None = None):
-    """转录结果路径：与源文件同名，后缀换成 .txt。
-
-    给了 out_dir 就放到该目录下（批量任务常用），否则落在源文件旁边。
-    """
+    """转录结果路径：与源文件同名，后缀换成 .txt。"""
     stem = os.path.splitext(os.path.basename(input_file))[0]
     base = out_dir if out_dir else os.path.dirname(input_file)
     return os.path.join(base, stem + ".txt")
@@ -232,7 +177,20 @@ def split_inputs(raw: str):
     return items
 
 
-def pipeline_transcribe_many(input_files, log, out_dir: str | None = None):
+def pipeline_transcribe(input_file: str, model_tier: str, log, out_dir: str | None = None):
+    tmp_path = None
+    try:
+        log(f"📁 提取音频：{input_file}")
+        tmp_path = extract_audio(input_file, log)
+        out = transcript_path(input_file, out_dir)
+        transcribe_audio(tmp_path, out, model_tier, log)
+        return out
+    finally:
+        if tmp_path and os.path.isfile(tmp_path):
+            os.remove(tmp_path)
+
+
+def pipeline_transcribe_many(input_files, model_tier, log, out_dir: str | None = None):
     """批量转录，返回成功产出的结果路径列表。
 
     单个文件失败不中断整批：记日志后继续下一个。
@@ -241,7 +199,7 @@ def pipeline_transcribe_many(input_files, log, out_dir: str | None = None):
     for i, src in enumerate(input_files, 1):
         log(f"===== [{i}/{len(input_files)}] {os.path.basename(src)} =====")
         try:
-            outputs.append(pipeline_transcribe(src, log, out_dir))
+            outputs.append(pipeline_transcribe(src, model_tier, log, out_dir))
         except Exception as e:
             log(f"💥 第 {i} 个失败：{type(e).__name__}: {e}")
     return outputs
@@ -261,12 +219,29 @@ def pipeline_polish(input_file: str, log):
     return output_file
 
 
+TIER_LABELS = {
+    "fast": "极速（0.6B Q8_0，下载 1.0GB，显存约 3GB）",
+    "balanced": "推荐（1.7B Q8_0，下载 2.5GB，显存约 5.5GB）",
+    "precise": "高精（1.7B bf16，下载 4.7GB，显存约 7.3GB）",
+}
+
+
+def available_tiers() -> list[str]:
+    """返回本地已存在完整模型文件的档位。"""
+    tiers = []
+    for key, (model, mmproj) in MODEL_TIERS.items():
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        if os.path.isfile(os.path.join(d, model)) and os.path.isfile(os.path.join(d, mmproj)):
+            tiers.append(key)
+    return tiers
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("视频转录 & 文本精校工具")
-        root.geometry("820x620")
-        root.minsize(700, 540)
+        root.geometry("860x700")
+        root.minsize(720, 580)
 
         self.msg_queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -275,16 +250,37 @@ class App:
 
         self._build_ui()
         self._poll_queue()
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
-        pad = {" padx": 8, "pady": 4}  # noqa
         top = ttk.Frame(self.root, padding=10)
         top.pack(fill="x")
 
-        # ===== 输入文件选择 =====
+        # ===== 模型选择 =====
         row = 0
+        ttk.Label(top, text="模型").grid(row=row, column=0, sticky="w")
+        self.var_tier = tk.StringVar()
+        tiers = available_tiers()
+        self.combo_tier = ttk.Combobox(
+            top, textvariable=self.var_tier, state="readonly", width=48,
+            values=[TIER_LABELS[t] for t in tiers],
+        )
+        self.combo_tier.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(8, 0))
+        if tiers:
+            self.combo_tier.current(0)
+        self._tier_keys = tiers
+
+        row += 1
+        if not tiers:
+            ttk.Label(
+                top, text="⚠️ 未找到模型文件，请检查程序目录下的 models/ 文件夹。",
+                foreground="#c0392b",
+            ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        # ===== 输入文件选择 =====
+        row += 1
         ttk.Label(top, text="步骤 1：选择 视频/音频 文件（可多选，一行一个）").grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(0, 4)
+            row=row, column=0, columnspan=3, sticky="w", pady=(10, 4)
         )
         row += 1
         self.txt_src = tk.Text(top, height=3, wrap="none", font=("Consolas", 9))
@@ -454,6 +450,12 @@ class App:
         finally:
             self.root.after(0, on_done)
 
+    def _current_tier(self) -> str:
+        idx = self.combo_tier.current()
+        if idx < 0:
+            raise RuntimeError("请先选择一个模型。")
+        return self._tier_keys[idx]
+
     def _on_transcribe(self):
         srcs = split_inputs(self._read(self.txt_src))
         missing = [s for s in srcs if not os.path.isfile(s)]
@@ -465,10 +467,11 @@ class App:
                 else "请先选择有效的 视频/音频 文件。",
             )
             return
+        tier = self._current_tier()
 
         def job():
             out_dir = self.var_outdir.get().strip() or None
-            outs = pipeline_transcribe_many(srcs, self.log, out_dir)
+            outs = pipeline_transcribe_many(srcs, tier, self.log, out_dir)
             if outs:
                 self.last_transcript = outs[-1]
                 self.root.after(0, lambda: self.btn_open_transcript.state(["!disabled"]))
@@ -525,6 +528,7 @@ class App:
                 else "一键流程需要先选择有效的 视频/音频 文件。",
             )
             return
+        tier = self._current_tier()
 
         def job():
             out_dir = self.var_outdir.get().strip() or None
@@ -532,7 +536,7 @@ class App:
             for i, src in enumerate(srcs, 1):
                 self.log(f"===== [{i}/{len(srcs)}] {os.path.basename(src)} =====")
                 try:
-                    out1 = pipeline_transcribe(src, self.log, out_dir)
+                    out1 = pipeline_transcribe(src, tier, self.log, out_dir)
                     self.last_transcript = out1
                     self.root.after(
                         0, lambda: self.btn_open_transcript.state(["!disabled"])
@@ -554,12 +558,12 @@ class App:
         self.worker = threading.Thread(target=self._worker, args=(job, done), daemon=True)
         self.worker.start()
 
+    def _on_close(self):
+        close_server()
+        self.root.destroy()
+
 
 def main():
-    try:
-        import av  # noqa
-    except ImportError:
-        pass  # 稍后真正用到时再报，避免启动崩溃
     root = tk.Tk()
     App(root)
     root.mainloop()
