@@ -30,9 +30,21 @@ def _app_root() -> str:
 def _models_root() -> str:
     """模型默认位置。
 
-    装到 Program Files 时程序目录对普通用户只读，模型下不进去，
-    所以默认放用户数据目录；用户可以在下载向导里改到别的盘。
+    优先选一个剩余空间足够的非系统盘。模型动辄 2~5GB，放 C 盘很容易
+    把系统盘塞满。都找不到合适的盘时退回用户数据目录。
     """
+    import shutil
+
+    need = 6 * 1024**3  # 最大档约 4.7GB，留些余量
+    for letter in ("D", "E", "F"):
+        drive = f"{letter}:\\"
+        if not os.path.isdir(drive):
+            continue
+        try:
+            if shutil.disk_usage(drive).free >= need:
+                return os.path.join(drive, "Video2Text", "models")
+        except OSError:
+            continue
     local = os.environ.get("LOCALAPPDATA")
     if local:
         return os.path.join(local, "Video2Text", "models")
