@@ -1,3 +1,7 @@
 av>=18.0.0
 soundfile>=0.12.1
 numpy>=1.21.0
+# 必须停在 6.8.x：6.9 起 Qt6Core 依赖 api-ms-win-core-winrt-* 这组
+# Windows 运行时 API Set，打包后独立运行会报
+# "DLL load failed while importing QtCore: 找不到指定的程序"。
+PySide6==6.8.3

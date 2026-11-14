@@ -2,7 +2,7 @@
 ; 编译：ISCC.exe installer.iss
 ; 产物：installer\Video2Text-Setup.exe
 
-#define AppName "视频转录 · 文本精校"
+#define AppName "视频转录"
 #define AppNameEn "Video2Text"
 #define AppVersion "1.0.0"
 #define AppPublisher "hujiyo"
@@ -16,6 +16,10 @@ AppPublisher={#AppPublisher}
 DefaultDirName={autopf}\{#AppNameEn}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
+; 覆盖安装时也显示目录页。默认 auto 会在检测到已安装时跳过，
+; 用户就没法把程序挪到别的盘。
+DisableDirPage=no
+UsePreviousAppDir=no
 OutputDir=installer
 OutputBaseFilename=Video2Text-Setup-{#AppVersion}
 Compression=lzma2/max
@@ -45,9 +49,12 @@ Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "立即运行 {#AppName}"; Flags: nowait postinstall skipifsilent
+; 不加 skipifsilent，静默安装时也不自动启动。
+; 程序启动失败会让 Inno 回滚整次安装，用户最后连文件和快捷方式都没有，
+; 排查起来也看不出失败原因。让用户装完自己点图标启动更可靠。
+Filename: "{app}\{#AppExe}"; Description: "运行 {#AppName}"; Flags: nowait postinstall
 
 [UninstallDelete]
 ; _internal 是 PyInstaller 的运行时文件，卸载时由主程序目录一并删除。
-; 模型放在 %LOCALAPPDATA%\Video2Text\models，不在此列，重装时无需重新下载。
+; 模型不在安装目录，重装时无需重新下载。
 Type: filesandordirs; Name: "{app}\_internal"

@@ -18,7 +18,6 @@ if errorlevel 1 (
     echo [ERROR] PyInstaller 失败
     exit /b 1
 )
-
 echo [3/4] 复制推理运行时...
 if not exist "dist\Video2Text\runtime" mkdir "dist\Video2Text\runtime"
 xcopy /Y /Q "runtime\llama-server.exe" "dist\Video2Text\runtime\" >nul
