@@ -17,9 +17,61 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+def _app_root() -> str:
+    """程序根目录（存放 runtime 与随包资源）。
+
+    PyInstaller 打包后 __file__ 落在 _internal 里，而 runtime 和 exe 同级。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _models_root() -> str:
+    """模型默认位置。
+
+    装到 Program Files 时程序目录对普通用户只读，模型下不进去，
+    所以默认放用户数据目录；用户可以在下载向导里改到别的盘。
+    """
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        return os.path.join(local, "Video2Text", "models")
+    return os.path.join(_app_root(), "models")
+
+
+def _config_path() -> str:
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "Video2Text", "config.json")
+
+
+def load_config() -> dict:
+    try:
+        with open(_config_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(**kwargs):
+    cfg = load_config()
+    cfg.update(kwargs)
+    path = _config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def models_dir() -> str:
+    """当前生效的模型目录，优先取用户配置。"""
+    configured = load_config().get("models_dir")
+    return configured if configured else _models_root()
+
+
+HERE = _app_root()
 BIN_DIR = os.path.join(HERE, "runtime")
-MODELS_DIR = os.path.join(HERE, "models")
 
 # 模型档位：名称 -> (主模型文件名, mmproj 文件名)
 MODEL_TIERS = {
@@ -49,8 +101,9 @@ class Server:
         self._lock = threading.Lock()
 
         model_name, mmproj_name = MODEL_TIERS[model_tier]
-        self.model_path = os.path.join(MODELS_DIR, model_name)
-        self.mmproj_path = os.path.join(MODELS_DIR, mmproj_name)
+        mdir = models_dir()
+        self.model_path = os.path.join(mdir, model_name)
+        self.mmproj_path = os.path.join(mdir, mmproj_name)
         for p in (self.model_path, self.mmproj_path):
             if not os.path.isfile(p):
                 raise FileNotFoundError(f"模型文件缺失：{p}")

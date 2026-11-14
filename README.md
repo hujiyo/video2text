@@ -21,9 +21,30 @@
 | 推荐 | 1.7B Q8_0 | 2.5 GB | 约 5.5 GB | 约 75x |
 | 高精 | 1.7B bf16 | 4.7 GB | 约 7.3 GB | 约 70x |
 
-模型文件放在程序目录的 `models/` 下，界面里选择档位即可切换。
+模型由程序首次启动时下载，界面里选择档位即可切换。
 
-## 安装
+## 打包分发
+
+用户拿到的产物是 `installer/Video2Text-Setup-<版本>.exe`，装完即用，不需要 Python 环境。
+
+首次启动会弹出模型下载向导，从国内镜像拉取权重到 `%LOCALAPPDATA%\Video2Text\models`。模型放在用户目录而非安装目录，因为装到 `Program Files` 时该目录对普通用户只读，且卸载重装后不必重新下载。
+
+构建：
+
+```
+build.bat
+```
+
+依次执行：PyInstaller 打包主程序 → 复制推理运行时 → Inno Setup 生成安装包。
+
+需要本机具备：
+
+- Python 环境（含 PyInstaller、PySide6）
+- llama.cpp 运行时放在 `runtime/`
+- Inno Setup 7
+- CUDA Toolkit 12.x（打包时从其中取 `cublas64_12.dll`、`cublasLt64_12.dll`、`cudart64_12.dll`）
+
+## 开发运行
 
 ```bash
 conda env create -f environment.yml
@@ -31,17 +52,13 @@ conda activate video
 python gui_app.py
 ```
 
-或：
+或直接 `run.bat`。
 
-```bash
-pip install -r requirements.txt
-python gui_app.py
-```
+## 目录结构
 
-## 目录要求
-
-- `runtime/`：llama-server 及其依赖的 DLL、CUDA 运行库
-- `models/`：至少一组 `Qwen3-ASR-*.gguf` 与对应的 `mmproj-*.gguf`
+- `runtime/`：llama-server 及其依赖的 DLL、CUDA 运行库（不入库）
+- `models/`：本地调试用的模型文件（不入库）
+- `dist/`、`installer/`：构建产物（不入库）
 
 ## 使用
 
